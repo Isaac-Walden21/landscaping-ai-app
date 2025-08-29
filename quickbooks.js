@@ -8,14 +8,87 @@ const SANDBOX_URL = 'https://sandbox-quickbooks.api.intuit.com';
 const PRODUCTION_URL = 'https://quickbooks.api.intuit.com';
 const TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 
-// Store the current realm ID (in production, use session or database)
+// Store the current realm ID - will be loaded from database on startup
 let currentRealmId = null;
+
+// Load the most recent realm ID on startup
+async function loadCurrentRealm() {
+  try {
+    const result = await db.pool.query(
+      'SELECT realm_id FROM quickbooks_tokens ORDER BY updated_at DESC LIMIT 1'
+    );
+    if (result.rows.length > 0) {
+      currentRealmId = result.rows[0].realm_id;
+      console.log('Loaded realm ID from database:', currentRealmId);
+    }
+  } catch (error) {
+    console.error('Error loading realm ID:', error);
+  }
+}
+
+// Call this on module load
+loadCurrentRealm();
+
+// Helper function to get valid tokens (refreshes if needed)
+async function getValidTokens() {
+  if (!currentRealmId) {
+    return null;
+  }
+  
+  const tokens = await db.getTokens(currentRealmId);
+  if (!tokens) {
+    return null;
+  }
+  
+  // Check if token is expired or about to expire (within 5 minutes)
+  const expiryTime = new Date(tokens.expires_at);
+  const now = new Date();
+  const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60000);
+  
+  if (expiryTime < fiveMinutesFromNow) {
+    console.log('Token expired or expiring soon, refreshing...');
+    
+    try {
+      const clientId = process.env.QB_CLIENT_ID;
+      const clientSecret = process.env.QB_CLIENT_SECRET;
+      const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+      
+      const tokenResponse = await axios.post(
+        TOKEN_URL,
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refresh_token
+        }),
+        {
+          headers: {
+            'Accept': 'application/json',
+            'Authorization': `Basic ${auth}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+      
+      const { access_token, refresh_token, expires_in } = tokenResponse.data;
+      
+      // Save new tokens
+      await db.saveTokens(currentRealmId, access_token, refresh_token, expires_in);
+      
+      // Return the new tokens
+      return await db.getTokens(currentRealmId);
+    } catch (error) {
+      console.error('Failed to refresh token:', error);
+      return null;
+    }
+  }
+  
+  return tokens;
+}
 
 router.get('/status', async (req, res) => {
   try {
     // Check if we have tokens in database
-    const tokens = currentRealmId ? await db.getTokens(currentRealmId) : null;
-    const isConnected = tokens && new Date(tokens.expires_at) > new Date();
+    const tokens = await getValidTokens();
+    const isConnected = tokens !== null;
     
     res.json({
       connected: isConnected,
@@ -113,7 +186,7 @@ router.get('/callback', async (req, res) => {
       <p>Company ID: ${realmId}</p>
       <p>Tokens have been saved to the database.</p>
       <p>Token expires in: ${expires_in} seconds</p>
-      <p>You can close this window.</p>
+      <p>Connection will persist across server restarts.</p>
       <br>
       <a href="/api/quickbooks/status">Check Connection Status</a>
     `);
@@ -128,69 +201,12 @@ router.get('/callback', async (req, res) => {
   }
 });
 
-// Refresh token endpoint
-router.post('/refresh-token', async (req, res) => {
-  try {
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'No realm ID available' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
-    if (!tokens) {
-      return res.status(404).json({ error: 'No tokens found' });
-    }
-    
-    const clientId = process.env.QB_CLIENT_ID;
-    const clientSecret = process.env.QB_CLIENT_SECRET;
-    const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    
-    const tokenResponse = await axios.post(
-      TOKEN_URL,
-      new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: tokens.refresh_token
-      }),
-      {
-        headers: {
-          'Accept': 'application/json',
-          'Authorization': `Basic ${auth}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
-      }
-    );
-    
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
-    
-    // Save new tokens
-    await db.saveTokens(currentRealmId, access_token, refresh_token, expires_in);
-    
-    res.json({
-      success: true,
-      message: 'Tokens refreshed',
-      expiresIn: expires_in
-    });
-    
-  } catch (error) {
-    console.error('Token refresh error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to refresh token' });
-  }
-});
-
 // Test QuickBooks API connection
 router.get('/company-info', async (req, res) => {
   try {
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'Not connected to QuickBooks' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
+    const tokens = await getValidTokens();
     if (!tokens) {
-      return res.status(404).json({ error: 'No tokens found' });
-    }
-    
-    // Check if token is expired
-    if (new Date(tokens.expires_at) < new Date()) {
-      return res.status(401).json({ error: 'Token expired, please refresh' });
+      return res.status(401).json({ error: 'Not connected to QuickBooks or token expired' });
     }
     
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
@@ -222,13 +238,9 @@ router.post('/create-customer', async (req, res) => {
   try {
     const { customer_info } = req.body;
     
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'Not connected to QuickBooks' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
-    if (!tokens || new Date(tokens.expires_at) < new Date()) {
-      return res.status(401).json({ error: 'Token expired or not found' });
+    const tokens = await getValidTokens();
+    if (!tokens) {
+      return res.status(401).json({ error: 'Not connected to QuickBooks or token expired' });
     }
     
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
@@ -338,13 +350,9 @@ router.post('/create-estimate', async (req, res) => {
   try {
     const { customerId, estimate_data } = req.body;
     
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'Not connected to QuickBooks' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
-    if (!tokens || new Date(tokens.expires_at) < new Date()) {
-      return res.status(401).json({ error: 'Token expired or not found' });
+    const tokens = await getValidTokens();
+    if (!tokens) {
+      return res.status(401).json({ error: 'Not connected to QuickBooks or token expired' });
     }
     
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
@@ -456,19 +464,15 @@ router.post('/create-estimate', async (req, res) => {
 // Get estimates from QuickBooks
 router.get('/estimates', async (req, res) => {
   try {
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'Not connected to QuickBooks' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
-    if (!tokens || new Date(tokens.expires_at) < new Date()) {
-      return res.status(401).json({ error: 'Token expired or not found' });
+    const tokens = await getValidTokens();
+    if (!tokens) {
+      return res.status(401).json({ error: 'Not connected to QuickBooks or token expired' });
     }
     
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
     
     const response = await axios.get(
-      `${baseUrl}/v3/company/${currentRealmId}/query?query= SELECT * FROM Estimate ORDER BY TxnDate DESC MAXRESULTS 20`,
+      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Estimate ORDER BY TxnDate DESC MAXRESULTS 20`,
       {
         headers: {
           'Authorization': `Bearer ${tokens.access_token}`,
@@ -494,19 +498,15 @@ router.get('/estimates', async (req, res) => {
 // Get invoices from QuickBooks
 router.get('/invoices', async (req, res) => {
   try {
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'Not connected to QuickBooks' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
-    if (!tokens || new Date(tokens.expires_at) < new Date()) {
-      return res.status(401).json({ error: 'Token expired or not found' });
+    const tokens = await getValidTokens();
+    if (!tokens) {
+      return res.status(401).json({ error: 'Not connected to QuickBooks or token expired' });
     }
     
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
     
     const response = await axios.get(
-      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Estimate ORDER BY TxnDate DESC MAXRESULTS 20`,
+      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Invoice ORDER BY TxnDate DESC MAXRESULTS 20`,
       {
         headers: {
           'Authorization': `Bearer ${tokens.access_token}`,
