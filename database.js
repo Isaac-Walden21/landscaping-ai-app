@@ -73,4 +73,3 @@ module.exports = {
   saveTokens,
   getTokens
 };
-EOF
