@@ -1,7 +1,5 @@
 cat > database.js << 'EOF'
 const { Pool } = require('pg');
-const db = require('./database');
-db.initializeDatabase().catch(console.error);
 
 // Railway provides DATABASE_URL automatically
 const pool = new Pool({
