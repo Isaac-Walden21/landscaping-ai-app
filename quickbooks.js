@@ -35,7 +35,7 @@ router.get('/status', async (req, res) => {
 });
 
 router.get('/test', (req, res) => {
-  res.json({ message: 'Test route works' });
+  res.json({ message: 'Test route works!' });
 });
 
 router.get('/auth', (req, res) => {
