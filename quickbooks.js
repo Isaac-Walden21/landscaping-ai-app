@@ -158,6 +158,291 @@ router.post('/refresh-token', async (req, res) => {
         }
       }
     );
+
+    // Add these routes to your existing quickbooks.js file
+
+// Create or update customer in QuickBooks
+router.post('/create-customer', async (req, res) => {
+  try {
+    const { customer_info } = req.body;
+    
+    if (!currentRealmId) {
+      return res.status(400).json({ error: 'Not connected to QuickBooks' });
+    }
+    
+    const tokens = await db.getTokens(currentRealmId);
+    if (!tokens || new Date(tokens.expires_at) < new Date()) {
+      return res.status(401).json({ error: 'Token expired or not found' });
+    }
+    
+    const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
+    
+    // Check if customer exists by email
+    let customerId = null;
+    try {
+      const searchResponse = await axios.get(
+        `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Customer where PrimaryEmailAddr='${customer_info.email}'`,
+        {
+          headers: {
+            'Authorization': `Bearer ${tokens.access_token}`,
+            'Accept': 'application/json'
+          }
+        }
+      );
+      
+      if (searchResponse.data.QueryResponse?.Customer?.length > 0) {
+        customerId = searchResponse.data.QueryResponse.Customer[0].Id;
+      }
+    } catch (searchError) {
+      console.log('Customer search error (likely not found):', searchError.message);
+    }
+    
+    let customer;
+    if (customerId) {
+      // Update existing customer
+      const updateResponse = await axios.post(
+        `${baseUrl}/v3/company/${currentRealmId}/customer`,
+        {
+          Id: customerId,
+          sparse: true,
+          DisplayName: customer_info.name,
+          PrimaryPhone: {
+            FreeFormNumber: customer_info.phone
+          }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${tokens.access_token}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      customer = updateResponse.data.Customer;
+    } else {
+      // Create new customer
+      const createResponse = await axios.post(
+        `${baseUrl}/v3/company/${currentRealmId}/customer`,
+        {
+          DisplayName: customer_info.name,
+          PrimaryEmailAddr: {
+            Address: customer_info.email
+          },
+          PrimaryPhone: {
+            FreeFormNumber: customer_info.phone
+          },
+          BillAddr: {
+            Line1: customer_info.address || '',
+            City: customer_info.city || '',
+            CountrySubDivisionCode: customer_info.state || '',
+            PostalCode: customer_info.zip || ''
+          }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${tokens.access_token}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      customer = createResponse.data.Customer;
+    }
+    
+    res.json({
+      success: true,
+      customer: customer,
+      isNew: !customerId
+    });
+    
+  } catch (error) {
+    console.error('Create customer error:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Failed to create customer',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// Create estimate in QuickBooks
+router.post('/create-estimate', async (req, res) => {
+  try {
+    const { customerId, estimate_data } = req.body;
+    
+    if (!currentRealmId) {
+      return res.status(400).json({ error: 'Not connected to QuickBooks' });
+    }
+    
+    const tokens = await db.getTokens(currentRealmId);
+    if (!tokens || new Date(tokens.expires_at) < new Date()) {
+      return res.status(401).json({ error: 'Token expired or not found' });
+    }
+    
+    const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
+    
+    // Build line items from estimate
+    const lineItems = [];
+    
+    // Add service items
+    if (estimate_data.serviceItems) {
+      estimate_data.serviceItems.forEach(item => {
+        lineItems.push({
+          DetailType: 'SalesItemLineDetail',
+          Amount: item.subtotal,
+          Description: `${item.description} - ${item.quantity} ${item.unit} @ $${item.rate}/${item.unit}`,
+          SalesItemLineDetail: {
+            ItemRef: {
+              value: '1', // You'll need to create/map actual QB items
+              name: 'Services'
+            }
+          }
+        });
+      });
+    }
+    
+    // Add material items
+    if (estimate_data.materialItems) {
+      estimate_data.materialItems.forEach(item => {
+        lineItems.push({
+          DetailType: 'SalesItemLineDetail',
+          Amount: item.subtotal,
+          Description: `${item.description} - ${item.quantity} ${item.unit}`,
+          SalesItemLineDetail: {
+            ItemRef: {
+              value: '2', // You'll need to create/map actual QB items
+              name: 'Materials'
+            }
+          }
+        });
+      });
+    }
+    
+    const estimatePayload = {
+      Line: lineItems,
+      CustomerRef: {
+        value: customerId
+      },
+      TxnDate: new Date().toISOString().split('T')[0],
+      ExpirationDate: new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0], // 30 days
+      CustomerMemo: {
+        value: estimate_data.projectInfo?.summary || 'Landscaping Estimate'
+      },
+      TotalAmt: estimate_data.pricing?.total || 0
+    };
+    
+    const response = await axios.post(
+      `${baseUrl}/v3/company/${currentRealmId}/estimate`,
+      estimatePayload,
+      {
+        headers: {
+          'Authorization': `Bearer ${tokens.access_token}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    // Save to local database
+    await db.pool.query(
+      `INSERT INTO estimates (customer_name, customer_email, estimate_data, quickbooks_estimate_id)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        estimate_data.customer_name,
+        estimate_data.customer_email,
+        JSON.stringify(estimate_data),
+        response.data.Estimate.Id
+      ]
+    );
+    
+    res.json({
+      success: true,
+      estimate: response.data.Estimate
+    });
+    
+  } catch (error) {
+    console.error('Create estimate error:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Failed to create estimate',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// Get estimates from QuickBooks
+router.get('/estimates', async (req, res) => {
+  try {
+    if (!currentRealmId) {
+      return res.status(400).json({ error: 'Not connected to QuickBooks' });
+    }
+    
+    const tokens = await db.getTokens(currentRealmId);
+    if (!tokens || new Date(tokens.expires_at) < new Date()) {
+      return res.status(401).json({ error: 'Token expired or not found' });
+    }
+    
+    const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
+    
+    const response = await axios.get(
+      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Estimate MAXRESULTS 20 ORDERBY TxnDate DESC`,
+      {
+        headers: {
+          'Authorization': `Bearer ${tokens.access_token}`,
+          'Accept': 'application/json'
+        }
+      }
+    );
+    
+    res.json({
+      success: true,
+      estimates: response.data.QueryResponse?.Estimate || []
+    });
+    
+  } catch (error) {
+    console.error('Get estimates error:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Failed to get estimates',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// Get invoices from QuickBooks
+router.get('/invoices', async (req, res) => {
+  try {
+    if (!currentRealmId) {
+      return res.status(400).json({ error: 'Not connected to QuickBooks' });
+    }
+    
+    const tokens = await db.getTokens(currentRealmId);
+    if (!tokens || new Date(tokens.expires_at) < new Date()) {
+      return res.status(401).json({ error: 'Token expired or not found' });
+    }
+    
+    const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
+    
+    const response = await axios.get(
+      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Invoice MAXRESULTS 20 ORDERBY TxnDate DESC`,
+      {
+        headers: {
+          'Authorization': `Bearer ${tokens.access_token}`,
+          'Accept': 'application/json'
+        }
+      }
+    );
+    
+    res.json({
+      success: true,
+      invoices: response.data.QueryResponse?.Invoice || []
+    });
+    
+  } catch (error) {
+    console.error('Get invoices error:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Failed to get invoices',
+      details: error.response?.data || error.message
+    });
+  }
+});
     
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     

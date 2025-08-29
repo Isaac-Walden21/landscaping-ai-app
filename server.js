@@ -403,6 +403,90 @@ app.post('/webhook/analyze-text', authenticateWebhook, async (req, res) => {
     });
   }
 });
+// Add this enhanced webhook to your server.js
+
+app.post('/webhook/analyze-and-sync', authenticateWebhook, async (req, res) => {
+  try {
+    const { text, customer_info, sync_to_quickbooks } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ error: 'Text is required' });
+    }
+
+    console.log('Webhook received text:', text);
+    
+    // Generate estimate from conversation
+    const analysis = await analyzeConversation(text);
+    const estimate = await generateEstimate(analysis);
+    
+    let quickbooksResult = null;
+    
+    // Sync to QuickBooks if requested
+    if (sync_to_quickbooks && customer_info) {
+      try {
+        // First create/update customer
+        const customerResponse = await fetch('http://localhost:3000/api/quickbooks/create-customer', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ customer_info })
+        });
+        
+        if (!customerResponse.ok) {
+          throw new Error('Failed to create customer in QuickBooks');
+        }
+        
+        const customerData = await customerResponse.json();
+        
+        // Then create the estimate
+        const estimatePayload = {
+          customerId: customerData.customer.Id,
+          estimate_data: {
+            ...estimate,
+            customer_name: customer_info.name,
+            customer_email: customer_info.email
+          }
+        };
+        
+        const estimateResponse = await fetch('http://localhost:3000/api/quickbooks/create-estimate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(estimatePayload)
+        });
+        
+        if (!estimateResponse.ok) {
+          throw new Error('Failed to create estimate in QuickBooks');
+        }
+        
+        quickbooksResult = await estimateResponse.json();
+        
+      } catch (qbError) {
+        console.error('QuickBooks sync error:', qbError);
+        quickbooksResult = { error: qbError.message };
+      }
+    }
+    
+    res.json({
+      success: true,
+      customer_info: customer_info || {},
+      transcription: text,
+      analysis: analysis,
+      estimate: estimate,
+      quickbooks: quickbooksResult,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Processing failed: ' + error.message 
+    });
+  }
+});
 
 app.post('/webhook/analyze-audio', upload.single('audio'), async (req, res) => {
   try {
