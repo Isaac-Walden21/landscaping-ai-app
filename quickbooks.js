@@ -158,8 +158,64 @@ router.post('/refresh-token', async (req, res) => {
         }
       }
     );
+    
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+    // Save new tokens
+    await db.saveTokens(currentRealmId, access_token, refresh_token, expires_in);
+    
+    res.json({
+      success: true,
+      message: 'Tokens refreshed',
+      expiresIn: expires_in
+    });
+    
+  } catch (error) {
+    console.error('Token refresh error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to refresh token' });
+  }
+});
 
-    // Add these routes to your existing quickbooks.js file
+// Test QuickBooks API connection
+router.get('/company-info', async (req, res) => {
+  try {
+    if (!currentRealmId) {
+      return res.status(400).json({ error: 'Not connected to QuickBooks' });
+    }
+    
+    const tokens = await db.getTokens(currentRealmId);
+    if (!tokens) {
+      return res.status(404).json({ error: 'No tokens found' });
+    }
+    
+    // Check if token is expired
+    if (new Date(tokens.expires_at) < new Date()) {
+      return res.status(401).json({ error: 'Token expired, please refresh' });
+    }
+    
+    const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
+    
+    // Get company info from QuickBooks
+    const response = await axios.get(
+      `${baseUrl}/v3/company/${currentRealmId}/companyinfo/${currentRealmId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${tokens.access_token}`,
+          'Accept': 'application/json'
+        }
+      }
+    );
+    
+    res.json({
+      success: true,
+      company: response.data
+    });
+    
+  } catch (error) {
+    console.error('Company info error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to get company info' });
+  }
+});
 
 // Create or update customer in QuickBooks
 router.post('/create-customer', async (req, res) => {
@@ -179,22 +235,24 @@ router.post('/create-customer', async (req, res) => {
     
     // Check if customer exists by email
     let customerId = null;
-    try {
-      const searchResponse = await axios.get(
-        `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Customer where PrimaryEmailAddr='${customer_info.email}'`,
-        {
-          headers: {
-            'Authorization': `Bearer ${tokens.access_token}`,
-            'Accept': 'application/json'
+    if (customer_info.email) {
+      try {
+        const searchResponse = await axios.get(
+          `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Customer where PrimaryEmailAddr='${customer_info.email}'`,
+          {
+            headers: {
+              'Authorization': `Bearer ${tokens.access_token}`,
+              'Accept': 'application/json'
+            }
           }
+        );
+        
+        if (searchResponse.data.QueryResponse?.Customer?.length > 0) {
+          customerId = searchResponse.data.QueryResponse.Customer[0].Id;
         }
-      );
-      
-      if (searchResponse.data.QueryResponse?.Customer?.length > 0) {
-        customerId = searchResponse.data.QueryResponse.Customer[0].Id;
+      } catch (searchError) {
+        console.log('Customer search error (likely not found):', searchError.message);
       }
-    } catch (searchError) {
-      console.log('Customer search error (likely not found):', searchError.message);
     }
     
     let customer;
@@ -206,9 +264,9 @@ router.post('/create-customer', async (req, res) => {
           Id: customerId,
           sparse: true,
           DisplayName: customer_info.name,
-          PrimaryPhone: {
+          PrimaryPhone: customer_info.phone ? {
             FreeFormNumber: customer_info.phone
-          }
+          } : undefined
         },
         {
           headers: {
@@ -221,23 +279,34 @@ router.post('/create-customer', async (req, res) => {
       customer = updateResponse.data.Customer;
     } else {
       // Create new customer
+      const customerData = {
+        DisplayName: customer_info.name || 'Unknown Customer'
+      };
+      
+      if (customer_info.email) {
+        customerData.PrimaryEmailAddr = {
+          Address: customer_info.email
+        };
+      }
+      
+      if (customer_info.phone) {
+        customerData.PrimaryPhone = {
+          FreeFormNumber: customer_info.phone
+        };
+      }
+      
+      if (customer_info.address || customer_info.city || customer_info.state || customer_info.zip) {
+        customerData.BillAddr = {
+          Line1: customer_info.address || '',
+          City: customer_info.city || '',
+          CountrySubDivisionCode: customer_info.state || '',
+          PostalCode: customer_info.zip || ''
+        };
+      }
+      
       const createResponse = await axios.post(
         `${baseUrl}/v3/company/${currentRealmId}/customer`,
-        {
-          DisplayName: customer_info.name,
-          PrimaryEmailAddr: {
-            Address: customer_info.email
-          },
-          PrimaryPhone: {
-            FreeFormNumber: customer_info.phone
-          },
-          BillAddr: {
-            Line1: customer_info.address || '',
-            City: customer_info.city || '',
-            CountrySubDivisionCode: customer_info.state || '',
-            PostalCode: customer_info.zip || ''
-          }
-        },
+        customerData,
         {
           headers: {
             'Authorization': `Bearer ${tokens.access_token}`,
@@ -284,7 +353,7 @@ router.post('/create-estimate', async (req, res) => {
     const lineItems = [];
     
     // Add service items
-    if (estimate_data.serviceItems) {
+    if (estimate_data.serviceItems && estimate_data.serviceItems.length > 0) {
       estimate_data.serviceItems.forEach(item => {
         lineItems.push({
           DetailType: 'SalesItemLineDetail',
@@ -301,7 +370,7 @@ router.post('/create-estimate', async (req, res) => {
     }
     
     // Add material items
-    if (estimate_data.materialItems) {
+    if (estimate_data.materialItems && estimate_data.materialItems.length > 0) {
       estimate_data.materialItems.forEach(item => {
         lineItems.push({
           DetailType: 'SalesItemLineDetail',
@@ -317,6 +386,21 @@ router.post('/create-estimate', async (req, res) => {
       });
     }
     
+    // Ensure we have at least one line item
+    if (lineItems.length === 0) {
+      lineItems.push({
+        DetailType: 'SalesItemLineDetail',
+        Amount: estimate_data.pricing?.total || 0,
+        Description: estimate_data.projectInfo?.summary || 'Landscaping Services',
+        SalesItemLineDetail: {
+          ItemRef: {
+            value: '1',
+            name: 'Services'
+          }
+        }
+      });
+    }
+    
     const estimatePayload = {
       Line: lineItems,
       CustomerRef: {
@@ -326,8 +410,7 @@ router.post('/create-estimate', async (req, res) => {
       ExpirationDate: new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0], // 30 days
       CustomerMemo: {
         value: estimate_data.projectInfo?.summary || 'Landscaping Estimate'
-      },
-      TotalAmt: estimate_data.pricing?.total || 0
+      }
     };
     
     const response = await axios.post(
@@ -343,16 +426,18 @@ router.post('/create-estimate', async (req, res) => {
     );
     
     // Save to local database
-    await db.pool.query(
-      `INSERT INTO estimates (customer_name, customer_email, estimate_data, quickbooks_estimate_id)
-       VALUES ($1, $2, $3, $4)`,
-      [
-        estimate_data.customer_name,
-        estimate_data.customer_email,
-        JSON.stringify(estimate_data),
-        response.data.Estimate.Id
-      ]
-    );
+    if (estimate_data.customer_name || estimate_data.customer_email) {
+      await db.pool.query(
+        `INSERT INTO estimates (customer_name, customer_email, estimate_data, quickbooks_estimate_id)
+         VALUES ($1, $2, $3, $4)`,
+        [
+          estimate_data.customer_name || 'Unknown',
+          estimate_data.customer_email || '',
+          JSON.stringify(estimate_data),
+          response.data.Estimate.Id
+        ]
+      );
+    }
     
     res.json({
       success: true,
@@ -443,63 +528,5 @@ router.get('/invoices', async (req, res) => {
     });
   }
 });
-    
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
-    
-    // Save new tokens
-    await db.saveTokens(currentRealmId, access_token, refresh_token, expires_in);
-    
-    res.json({
-      success: true,
-      message: 'Tokens refreshed',
-      expiresIn: expires_in
-    });
-    
-  } catch (error) {
-    console.error('Token refresh error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to refresh token' });
-  }
-});
 
-// Test QuickBooks API connection
-router.get('/company-info', async (req, res) => {
-  try {
-    if (!currentRealmId) {
-      return res.status(400).json({ error: 'Not connected to QuickBooks' });
-    }
-    
-    const tokens = await db.getTokens(currentRealmId);
-    if (!tokens) {
-      return res.status(404).json({ error: 'No tokens found' });
-    }
-    
-    // Check if token is expired
-    if (new Date(tokens.expires_at) < new Date()) {
-      return res.status(401).json({ error: 'Token expired, please refresh' });
-    }
-    
-    const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
-    
-    // Get company info from QuickBooks
-    const response = await axios.get(
-      `${baseUrl}/v3/company/${currentRealmId}/companyinfo/${currentRealmId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${tokens.access_token}`,
-          'Accept': 'application/json'
-        }
-      }
-    );
-    
-    res.json({
-      success: true,
-      company: response.data
-    });
-    
-  } catch (error) {
-    console.error('Company info error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to get company info' });
-  }
-});
-
-module.exports = router;// OAuth implementation complete
+module.exports = router;
