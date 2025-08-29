@@ -1,9 +1,37 @@
 const { Pool } = require('pg');
 
-// Railway provides DATABASE_URL automatically
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+// Parse Railway's DATABASE_URL properly
+let poolConfig = {};
+
+if (process.env.DATABASE_URL) {
+  // Railway provides a connection string that needs to be parsed
+  poolConfig = {
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false
+    }
+  };
+} else {
+  // Fallback for local development
+  poolConfig = {
+    host: 'localhost',
+    port: 5432,
+    database: 'landscaping',
+    user: 'postgres',
+    password: 'postgres'
+  };
+}
+
+const pool = new Pool(poolConfig);
+
+// Test database connection
+pool.connect((err, client, release) => {
+  if (err) {
+    console.error('Error connecting to database:', err.stack);
+  } else {
+    console.log('Database connected successfully');
+    release();
+  }
 });
 
 // Create tables if they don't exist
@@ -56,15 +84,26 @@ async function saveTokens(realmId, accessToken, refreshToken, expiresIn) {
       updated_at = CURRENT_TIMESTAMP
   `;
   
-  await pool.query(query, [realmId, accessToken, refreshToken, expiresAt]);
+  try {
+    await pool.query(query, [realmId, accessToken, refreshToken, expiresAt]);
+    console.log('Tokens saved successfully');
+  } catch (error) {
+    console.error('Error saving tokens:', error);
+    throw error;
+  }
 }
 
 async function getTokens(realmId) {
-  const result = await pool.query(
-    'SELECT * FROM quickbooks_tokens WHERE realm_id = $1',
-    [realmId]
-  );
-  return result.rows[0];
+  try {
+    const result = await pool.query(
+      'SELECT * FROM quickbooks_tokens WHERE realm_id = $1',
+      [realmId]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error getting tokens:', error);
+    return null;
+  }
 }
 
 module.exports = {
