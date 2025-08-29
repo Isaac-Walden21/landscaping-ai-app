@@ -468,7 +468,7 @@ router.get('/estimates', async (req, res) => {
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
     
     const response = await axios.get(
-      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Estimate MAXRESULTS 20 ORDERBY TxnDate DESC`,
+      `${baseUrl}/v3/company/${currentRealmId}/query?query= SELECT * FROM Estimate ORDER BY TxnDate DESC MAXRESULTS 20`,
       {
         headers: {
           'Authorization': `Bearer ${tokens.access_token}`,
@@ -506,7 +506,7 @@ router.get('/invoices', async (req, res) => {
     const baseUrl = process.env.QB_ENVIRONMENT === 'production' ? PRODUCTION_URL : SANDBOX_URL;
     
     const response = await axios.get(
-      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Invoice MAXRESULTS 20 ORDERBY TxnDate DESC`,
+      `${baseUrl}/v3/company/${currentRealmId}/query?query=select * from Estimate ORDER BY TxnDate DESC MAXRESULTS 20`,
       {
         headers: {
           'Authorization': `Bearer ${tokens.access_token}`,
