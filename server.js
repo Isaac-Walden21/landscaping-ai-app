@@ -4,6 +4,7 @@ const OpenAI = require('openai');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const db = require('./database');
 require('dotenv').config();
 
 const app = express();
@@ -12,6 +13,7 @@ const port = 3000;
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
+
 
 // Add middleware
 app.use(express.json());
@@ -504,7 +506,12 @@ app.get('/api/debug-files', (req, res) => {
 
 app.use(express.static('.'));
 
-// Only ONE app.listen - removed the duplicate
+db.initializeDatabase().then(() => {
+  console.log('Database initialization complete');
+}).catch(err => {
+  console.error('Failed to initialize database:', err);
+});
+
 app.listen(port, () => {
   console.log(`Server is ready! Running on port ${port}`);
   console.log('Current working directory:', process.cwd());
